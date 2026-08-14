@@ -1,0 +1,6 @@
+# Block all environment files
+.env
+.env.*
+
+# Except explicitly track the local example template
+!.env.example

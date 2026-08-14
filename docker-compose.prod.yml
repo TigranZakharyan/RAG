@@ -1,0 +1,11 @@
+services:
+  api:
+    build:
+      context: app
+      target: production
+    container_name: fastapi_prod
+    env_file:
+      - .env.production
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    restart: unless-stopped

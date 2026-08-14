@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: app
+      target: development
+    container_name: fastapi_dev
+    env_file:
+      - .env.development
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    volumes:
+      - ./app:/app
+    restart: unless-stopped
