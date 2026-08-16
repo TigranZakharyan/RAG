@@ -10,4 +10,20 @@ services:
       - "${API_PORT}:${API_PORT}"
     volumes:
       - ./app:/app
+    depends_on:
+      - postgres
     restart: unless-stopped
+
+  postgres:
+    image: postgres:15.3-alpine
+    container_name: postgres_dev
+    env_file:
+      - .env.development
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
