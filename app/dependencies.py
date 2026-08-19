@@ -3,7 +3,7 @@ from fastapi import Security
 from fastapi.security import APIKeyCookie
 from sqlmodel import Session, select
 
-from db.database import get_session
+from core.database import get_session
 from libs.auth import verify_access_token
 from models.user import User
 

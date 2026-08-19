@@ -10,8 +10,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Combine system package updates and cleaning
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
+    g++ \
     gcc \
+    build-essential \
+    libxcb1 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libglib2.0-0 \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 from models.user import User
 from libs.crypt import verify_password, crypt_password
 from libs.auth import create_access_token
-from db.database import get_session
+from core.database import get_session
 from schemas.auth import UserCreate, UserCreateResponse, LoginResponse
 
 auth_router = APIRouter(prefix="/auth", tags=["auth"])

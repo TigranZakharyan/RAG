@@ -10,7 +10,7 @@ class UserCreateResponse(BaseModel):
     username: str
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class LoginResponse(BaseModel):
     access_token: str

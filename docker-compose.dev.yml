@@ -6,12 +6,17 @@ services:
     container_name: fastapi_dev
     env_file:
       - .env.development
+    environment:
+      TORCH_COMPILE_DISABLE: "1"
+      TORCHDYNAMO_DISABLE: "1"
     ports:
       - "${API_PORT}:${API_PORT}"
     volumes:
       - ./app:/app
     depends_on:
       - postgres
+      - minio
+      - qdrant
     restart: unless-stopped
 
   postgres:
@@ -25,5 +30,84 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin_dev
+    env_file:
+      - .env.development
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio_dev
+    env_file:
+      - .env.development
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: app
+      target: development
+    container_name: ingestion_worker
+    env_file:
+      - .env.development
+    command:
+      - watchmedo
+      - auto-restart
+      - --directory=./
+      - --pattern=*.py
+      - --recursive
+      - --
+      - celery
+      - -A
+      - workers.tasks
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+    volumes:
+      - ./app:/app
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis_dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant_dev
+    ports:
+      - "6333:6333" # HTTP API and Web Dashboard
+      - "6334:6334" # gRPC API
+    env_file:
+      - .env.development
+    volumes:
+      - qdrant_data:/qdrant/storage:z
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  pgadmin_data:
+  minio_data:
+  qdrant_data:
+  redis_data:
