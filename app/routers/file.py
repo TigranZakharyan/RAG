@@ -490,7 +490,7 @@ async def delete_file(
     # Delete Qdrant data
     # -----------------------------------------------
 
-    from core.qdrant import qdrant_service
+    from services.qdrant_service import qdrant_service
 
     for job in jobs:
 

@@ -10,7 +10,7 @@ from sqlmodel import Session
 
 from core.database import engine
 from core.minio import minio_client
-from core.qdrant import qdrant_service
+from services.qdrant_service import qdrant_service
 from core.settings import settings
 
 from models.file import File
@@ -391,11 +391,9 @@ class IngestionService:
                         total_chunks=total,
                     )
 
-                    embeddings = (
+                    dense_embeddings, sparse_embeddings = (
                         embedding_service
-                        .embed_dense(
-                            texts
-                        )
+                        .embed(texts)
                     )
 
                     # =========================
@@ -406,19 +404,30 @@ class IngestionService:
 
                     points = []
 
-                    for child, embedding in zip(
+                    for child, dense_emb, sparse_emb in zip(
                         batch,
-                        embeddings,
+                        dense_embeddings,
+                        sparse_embeddings,
                     ):
 
                         parent = parents.get(
                             child.parent_id
                         )
 
+                        # Convert FastEmbed sparse output to Qdrant SparseVector model
+                        sparse_vector = models.SparseVector(
+                            indices=sparse_emb.indices.tolist(),
+                            values=sparse_emb.values.tolist(),
+                        )
+
                         points.append(
                             models.PointStruct(
                                 id=str(uuid4()),
-                                vector=embedding,
+                                # Pass vectors as a dictionary for hybrid collections
+                                vector={
+                                    "dense": dense_emb,
+                                    "sparse": sparse_vector,
+                                },
                                 payload={
                                     # Ownership
                                     "user_id": job.user_id,
@@ -467,7 +476,7 @@ class IngestionService:
                                 },
                             )
                         )
-
+                        
                     # =========================
                     # Upload
                     # =========================
