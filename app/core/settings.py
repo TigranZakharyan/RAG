@@ -33,5 +33,10 @@ class Settings(BaseSettings):
     redis_host: str = "redis"
     redis_port: int = 6379
 
+    # Ollama
+    ollama_base_url: str = "http://ollama:11434"
+    ollama_model: str = "gemma4:31b-cloud"
+    ollama_temperature: float = 0.2
+
 
 settings = Settings()

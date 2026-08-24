@@ -1,122 +1,176 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import React, { useEffect, useState } from 'react';
+import type { Conversation, FileItem } from './types';
+import { conversationApi, fileApi } from './api';
+import { useAuth } from './context/AuthContext';
+import { AuthModal } from './components/AuthModal';
+import { Sidebar } from './components/Sidebar';
+import { ChatArea } from './components/ChatArea';
+import { FilesDrawer } from './components/FilesDrawer';
+import { Bot, MessageSquarePlus, Sparkles } from 'lucide-react';
 
-function App() {
-  const [count, setCount] = useState(0)
+export const App: React.FC = () => {
+  const { user, loading } = useAuth();
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const [files, setFiles] = useState<FileItem[]>([]);
+  const [showFiles, setShowFiles] = useState<boolean>(true);
+
+
+  // Load all user conversations
+  const loadConversations = async () => {
+    if (!user) return;
+    try {
+      const list = await conversationApi.list();
+      setConversations(list);
+      if (list.length > 0 && (!activeId || !list.find((c) => c.id === activeId))) {
+        setActiveId(list[0].id);
+      }
+    } catch (err) {
+      console.error('Failed to load conversations', err);
+    }
+  };
+
+
+  // Load files for the active conversation
+  const loadFiles = async (conversationId: number) => {
+    try {
+      const data = await fileApi.listByConversation(conversationId);
+      setFiles(data);
+    } catch (err) {
+      console.error('Failed to load files', err);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      loadConversations();
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (activeId) {
+      loadFiles(activeId);
+    } else {
+      setFiles([]);
+    }
+  }, [activeId]);
+
+  const handleCreateConversation = async (title: string) => {
+    try {
+      const newConv = await conversationApi.create(title);
+      setConversations((prev) => [newConv, ...prev]);
+      setActiveId(newConv.id);
+    } catch (err) {
+      console.error('Failed to create conversation', err);
+    }
+  };
+
+  const handleUpdateConversation = async (id: number, title: string) => {
+    try {
+      const updated = await conversationApi.update(id, title);
+      setConversations((prev) => prev.map((c) => (c.id === id ? updated : c)));
+    } catch (err) {
+      console.error('Failed to update conversation', err);
+    }
+  };
+
+  const handleDeleteConversation = async (id: number) => {
+    try {
+      await conversationApi.delete(id);
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      if (activeId === id) {
+        const remaining = conversations.filter((c) => c.id !== id);
+        setActiveId(remaining.length > 0 ? remaining[0].id : null);
+      }
+    } catch (err) {
+      console.error('Failed to delete conversation', err);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="auth-wrapper">
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+          <div className="avatar" style={{ width: 44, height: 44 }}>
+            <Sparkles size={22} className="animate-spin" />
+          </div>
+          <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+            Initializing workspace...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthModal />;
+  }
+
+  const activeConversation = conversations.find((c) => c.id === activeId);
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <div className="app-container">
+      {/* Left Sidebar */}
+      <Sidebar
+        conversations={conversations}
+        activeId={activeId}
+        onSelect={setActiveId}
+        onCreate={handleCreateConversation}
+        onUpdate={handleUpdateConversation}
+        onDelete={handleDeleteConversation}
+      />
 
-      <div className="ticks"></div>
+      {/* Main Content Workspace */}
+      <main className="main-content">
+        {activeConversation ? (
+          <div className="workspace-body">
+            <ChatArea
+              conversation={activeConversation}
+              files={files}
+              onToggleFiles={() => setShowFiles(!showFiles)}
+              showFiles={showFiles}
+            />
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+            {showFiles && (
+              <FilesDrawer
+                conversationId={activeConversation.id}
+                files={files}
+                onFileUploaded={() => loadFiles(activeConversation.id)}
+                onFileDeleted={async (fileId) => {
+                  try {
+                    await fileApi.delete(fileId);
+                    setFiles((prev) => prev.filter((f) => f.id !== fileId));
+                    loadFiles(activeConversation.id);
+                  } catch (err: any) {
+                    alert(`Failed to delete file: ${err.message || 'Unknown error'}`);
+                  }
+                }}
+              />
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
-  )
-}
-
-export default App
+            )}
+          </div>
+        ) : (
+          <div className="empty-state">
+            <div className="avatar" style={{ width: 56, height: 56 }}>
+              <Bot size={28} />
+            </div>
+            <h2 style={{ color: '#E0E7FF', fontWeight: 600 }}>Welcome to RAG AI</h2>
+            <p style={{ maxWidth: 400, fontSize: '0.9rem' }}>
+              Create or select a conversation to upload documents and begin chatting with Ollama in real-time.
+            </p>
+            <button
+              id="create-first-chat-btn"
+              className="new-chat-btn"
+              onClick={() => handleCreateConversation('New Project')}
+              style={{ marginTop: 8 }}
+            >
+              <MessageSquarePlus size={16} />
+              <span>Create New Conversation</span>
+            </button>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+export default App;

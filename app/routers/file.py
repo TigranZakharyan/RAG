@@ -142,10 +142,6 @@ async def upload_file(
         size=file_size,
     )
 
-    print(222, db_file)
-
-    print("BEFORE:", db_file.model_dump())
-
     session.add(db_file)
     session.commit()
 
@@ -176,8 +172,6 @@ async def upload_file(
         args=[job.id],
         task_id=job.id,
     )
-
-    print(111, db_file)
 
     return {
         "file": db_file.model_dump(),
@@ -299,7 +293,7 @@ async def cancel_ingestion(
             status_code=400,
             detail=(
                 f"Cannot cancel ingestion "
-                f"with status '{job.status}'"
+                f"with status '{job.status.value}'"
             ),
         )
 
@@ -459,73 +453,57 @@ async def delete_file(
         )
 
     # -----------------------------------------------
-    # Find running ingestion
+    # Find associated ingestion jobs
     # -----------------------------------------------
 
     jobs = session.exec(
         select(IngestionJob)
         .where(
             IngestionJob.file_id == file_id,
-            IngestionJob.user_id == user.id,
         )
     ).all()
 
-    for job in jobs:
-
-        if job.status in (
-            IngestionStatus.QUEUED,
-            IngestionStatus.PROCESSING,
-            IngestionStatus.CANCELLING,
-        ):
-
-            job.status = (
-                IngestionStatus.CANCELLING
-            )
-
-            session.add(job)
-
-    session.commit()
-
     # -----------------------------------------------
-    # Delete Qdrant data
+    # Delete Qdrant vector data for each ingestion job
     # -----------------------------------------------
 
     from services.qdrant_service import qdrant_service
 
     for job in jobs:
+        try:
+            qdrant_service.delete_ingestion(
+                conversation_id=job.conversation_id,
+                ingestion_id=job.id,
+            )
+        except Exception as e:
+            print(f"QDRANT DELETE ERROR: {e}")
 
-        qdrant_service.delete_ingestion(
-            conversation_id=
-                job.conversation_id,
-
-            ingestion_id=
-                job.id,
-        )
+    # -----------------------------------------------
+    # Delete IngestionJob records from Postgres
+    # -----------------------------------------------
+    for job in jobs:
+        session.delete(job)
+    session.flush()
 
     # -----------------------------------------------
     # Delete MinIO object
     # -----------------------------------------------
 
     try:
-
         minio_client.remove_object(
             settings.minio_bucket,
             file.path,
         )
-
     except Exception as e:
-
-        print(
-            f"MINIO DELETE ERROR: {e}"
-        )
+        print(f"MINIO DELETE ERROR: {e}")
 
     # -----------------------------------------------
-    # Delete DB
+    # Delete File from DB
     # -----------------------------------------------
 
     session.delete(file)
-
     session.commit()
+
 
     return {
         "message": "File deleted successfully",

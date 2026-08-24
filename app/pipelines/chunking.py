@@ -3,12 +3,13 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 try:
     import tiktoken
     _ENC = tiktoken.get_encoding("cl100k_base")
-except Exception:  # pragma: no cover - fallback if tiktoken unavailable
+except Exception:  # pragma: no cover
     _ENC = None
 
 
@@ -17,43 +18,51 @@ except Exception:  # pragma: no cover - fallback if tiktoken unavailable
 # --------------------------------------------------------------------------
 
 def count_tokens(text: str) -> int:
+    """Single-string count. Prefer count_tokens_batch when counting many
+    strings — it avoids per-call tiktoken overhead."""
     if not text:
         return 0
     if _ENC is not None:
-        return len(_ENC.encode(text))
-    # Rough fallback: ~1.3 tokens per whitespace-split word.
+        return len(_ENC.encode_ordinary(text))
     words = text.split()
     return max(1, int(len(words) * 1.3))
 
 
+@lru_cache(maxsize=4096)
+def _count_tokens_cached(text: str) -> int:
+    # Cheap win: headings and short atoms recur a lot across a document.
+    return count_tokens(text)
+
+
+def count_tokens_batch(texts: List[str]) -> List[int]:
+    """Batch-tokenize many strings in one tiktoken call instead of N calls."""
+    if not texts:
+        return []
+    if _ENC is not None:
+        return [len(t) for t in _ENC.encode_ordinary_batch(texts)]
+    return [count_tokens(t) for t in texts]
+
+
+def _decode_to_token_limit(text: str, max_tokens: int) -> str:
+    """Truncate text to max_tokens without repeatedly re-encoding."""
+    if _ENC is None:
+        words = text.split()
+        while words and count_tokens(" ".join(words)) > max_tokens:
+            words.pop()
+        return " ".join(words).strip()
+
+    tokens = _ENC.encode_ordinary(text)
+    if len(tokens) <= max_tokens:
+        return text.strip()
+    truncated = _ENC.decode(tokens[:max_tokens])
+    # avoid cutting mid-word
+    if truncated and not truncated.endswith((" ", "\n")):
+        truncated = truncated.rsplit(" ", 1)[0]
+    return truncated.strip()
+
+
 # --------------------------------------------------------------------------
-# Data model
-# --------------------------------------------------------------------------
-
-@dataclass
-class ChildChunk:
-    id: str
-    parent_id: str
-    text: str                 # raw chunk text
-    embedding_text: str       # text + prepended doc summary (for vector search)
-    tokens: int
-    heading_path: str
-    index_in_parent: int
-
-
-@dataclass
-class ParentChunk:
-    id: str
-    text: str                 # full parent text, fed to the LLM at answer time
-    tokens: int
-    heading_path: str
-    index: int
-    children: List[ChildChunk] = field(default_factory=list)
-
-
-# --------------------------------------------------------------------------
-# Step 1: Split markdown into structural blocks (headings, paragraphs,
-# fenced code blocks, list groups) while tracking heading hierarchy.
+# Step 1: unchanged (regex block splitting is already cheap/linear)
 # --------------------------------------------------------------------------
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
@@ -61,10 +70,6 @@ _FENCE_RE = re.compile(r"^```")
 
 
 def _split_into_blocks(md: str) -> List[Tuple[str, Optional[Tuple[int, str]]]]:
-    """
-    Returns a list of (block_text, heading_or_None) tuples.
-    heading_or_None is (level, title) when the block IS a heading line.
-    """
     lines = md.split("\n")
     blocks: List[Tuple[str, Optional[Tuple[int, str]]]] = []
     buf: List[str] = []
@@ -84,11 +89,9 @@ def _split_into_blocks(md: str) -> List[Tuple[str, Optional[Tuple[int, str]]]]:
             if not in_code:
                 flush()
             continue
-
         if in_code:
             buf.append(line)
             continue
-
         heading_match = _HEADING_RE.match(line)
         if heading_match:
             flush()
@@ -96,11 +99,9 @@ def _split_into_blocks(md: str) -> List[Tuple[str, Optional[Tuple[int, str]]]]:
             title = heading_match.group(2).strip()
             blocks.append((line.strip(), (level, title)))
             continue
-
         if line.strip() == "":
             flush()
             continue
-
         buf.append(line)
 
     flush()
@@ -112,8 +113,7 @@ def _heading_path(stack: List[Tuple[int, str]]) -> str:
 
 
 # --------------------------------------------------------------------------
-# Step 2: Auto-extract a short document-level summary for contextual
-# enrichment (used when the caller doesn't supply their own).
+# Step 2: auto summary — now O(1) encodes instead of O(n)
 # --------------------------------------------------------------------------
 
 def _auto_summary(md: str, max_tokens: int = 50) -> str:
@@ -130,19 +130,14 @@ def _auto_summary(md: str, max_tokens: int = 50) -> str:
             break
 
     summary = f"{title}. {first_para}" if title else first_para
-    # Trim to max_tokens without cutting mid-word.
-    words = summary.split()
-    while words and count_tokens(" ".join(words)) > max_tokens:
-        words.pop()
-    summary = " ".join(words).strip()
+    summary = _decode_to_token_limit(summary, max_tokens)
     if summary and not summary.endswith((".", "!", "?")):
         summary += "..."
     return summary
 
 
 # --------------------------------------------------------------------------
-# Step 3: Pack blocks into parent chunks (500-1000 tokens by default),
-# preferring not to split a block, and tracking heading path per parent.
+# Step 3: pack blocks into parents — batch-count all block tokens upfront
 # --------------------------------------------------------------------------
 
 def _build_parents(
@@ -150,12 +145,15 @@ def _build_parents(
     parent_min: int,
     parent_max: int,
 ) -> List[Tuple[str, str]]:
-    """Returns list of (parent_text, heading_path)."""
     parents: List[Tuple[str, str]] = []
     stack: List[Tuple[int, str]] = []
     buf: List[str] = []
     buf_tokens = 0
     buf_heading_path = ""
+
+    # One batched tiktoken call for every block, instead of one call per block.
+    block_texts = [b[0] for b in blocks]
+    block_tok_counts = count_tokens_batch(block_texts)
 
     def flush():
         nonlocal buf, buf_tokens
@@ -164,22 +162,19 @@ def _build_parents(
             buf = []
             buf_tokens = 0
 
-    for text, heading in blocks:
+    for (text, heading), block_tokens in zip(blocks, block_tok_counts):
         if heading:
             level, title = heading
             while stack and stack[-1][0] >= level:
                 stack.pop()
             stack.append((level, title))
-            # A new heading is a natural break point once we've hit parent_min.
             if buf_tokens >= parent_min:
                 flush()
             if not buf:
                 buf_heading_path = _heading_path(stack)
             buf.append(text)
-            buf_tokens += count_tokens(text)
+            buf_tokens += block_tokens
             continue
-
-        block_tokens = count_tokens(text)
 
         if buf_tokens + block_tokens > parent_max and buf_tokens >= parent_min:
             flush()
@@ -191,8 +186,6 @@ def _build_parents(
         buf.append(text)
         buf_tokens += block_tokens
 
-        # A single oversized block (e.g. huge code sample) becomes its own
-        # parent immediately so later chunks aren't starved.
         if block_tokens >= parent_max:
             flush()
             buf_heading_path = _heading_path(stack)
@@ -202,16 +195,59 @@ def _build_parents(
 
 
 # --------------------------------------------------------------------------
-# Step 4: Split each parent into overlapping child chunks (100-200 tokens),
-# packing on sentence/line boundaries and carrying an overlap tail forward.
+# --------------------------------------------------------------------------
+# Step 4: Multilingual children splitting & atom packing
 # --------------------------------------------------------------------------
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\[`])|\n+")
+# Universal sentence boundary regex:
+# Matches standard punctuation (. ! ?), Armenian (։ ՜ ՞ ՝), Arabic/Persian (؟ ۔),
+# Hindi/Sanskrit (। ॥), CJK (。 ！？), followed by whitespace/newlines or line breaks.
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?:[\.\!\?\u0589\u055C\u055E\u055D\u061F\u06D4\u0964\u0965\u3002\uFF01\uFF1F]+[\s\n]+|\n+)"
+)
 
 
-def _split_atoms(text: str) -> List[str]:
-    atoms = _SENTENCE_SPLIT_RE.split(text)
-    return [a.strip() for a in atoms if a.strip()]
+def _split_atoms(text: str, max_atom_tokens: int = 150) -> List[str]:
+    """
+    Splits text on multilingual sentence and line boundaries.
+    If a sentence or block is still oversized (> max_atom_tokens), it is split
+    by word boundaries to prevent any single atom from starving or overflowing
+    the chunk packing buffer.
+    """
+    raw_atoms = _SENTENCE_SPLIT_RE.split(text)
+    atoms: List[str] = []
+
+    for a in raw_atoms:
+        trimmed = a.strip()
+        if not trimmed:
+            continue
+
+        # Fast path: short atom
+        if len(trimmed) <= max_atom_tokens * 3:
+            atoms.append(trimmed)
+            continue
+
+        tok_len = count_tokens(trimmed)
+        if tok_len <= max_atom_tokens:
+            atoms.append(trimmed)
+        else:
+            # Sub-split oversized atom by whitespace / words
+            words = trimmed.split()
+            buf: List[str] = []
+            buf_tok = 0
+            for w in words:
+                w_tok = max(1, count_tokens(w))
+                if buf and buf_tok + w_tok > max_atom_tokens:
+                    atoms.append(" ".join(buf))
+                    buf = [w]
+                    buf_tok = w_tok
+                else:
+                    buf.append(w)
+                    buf_tok += w_tok
+            if buf:
+                atoms.append(" ".join(buf))
+
+    return atoms
 
 
 def _build_children(
@@ -219,52 +255,99 @@ def _build_children(
     child_min: int,
     child_max: int,
     overlap_ratio: float,
-) -> List[str]:
-    atoms = _split_atoms(parent_text)
+) -> List[Tuple[str, int]]:
+    """
+    Packs atoms into child chunks (child_min to child_max tokens) with sliding overlap.
+    Safely advances without infinite looping on any input text.
+    """
+    atoms = _split_atoms(parent_text, max_atom_tokens=child_max)
     if not atoms:
         return []
 
-    chunks: List[List[str]] = []
-    current: List[str] = []
+    atom_tokens_list = count_tokens_batch(atoms)
+
+    chunks: List[List[Tuple[str, int]]] = []
+    current: List[Tuple[str, int]] = []
     current_tokens = 0
     i = 0
 
     while i < len(atoms):
-        atom = atoms[i]
-        atom_tokens = count_tokens(atom)
+        atom, atom_tokens = atoms[i], atom_tokens_list[i]
 
-        if current and current_tokens + atom_tokens > child_max:
+        # If adding this atom exceeds max and we already have content in current chunk
+        if current and (current_tokens + atom_tokens > child_max):
             chunks.append(current)
-            # Carry an overlap tail (~overlap_ratio of child_max) into the
-            # next chunk so context isn't severed at the boundary.
-            target_overlap = overlap_ratio * child_max
-            tail: List[str] = []
+            target_overlap = int(overlap_ratio * child_max)
+            tail: List[Tuple[str, int]] = []
             tail_tokens = 0
-            for a in reversed(current):
-                a_tok = count_tokens(a)
+
+            # Calculate overlap tail
+            for a, a_tok in reversed(current):
                 if tail_tokens + a_tok > target_overlap:
                     break
-                tail.insert(0, a)
+                tail.insert(0, (a, a_tok))
                 tail_tokens += a_tok
+
             current = tail
             current_tokens = tail_tokens
-            continue  # retry same atom against the fresh (overlapped) buffer
 
-        current.append(atom)
+            # If tail + atom is still too big, start a fresh chunk directly with this atom
+            if current and (current_tokens + atom_tokens > child_max):
+                chunks.append(current)
+                current = []
+                current_tokens = 0
+
+            # If current is empty, append atom and advance immediately
+            if not current:
+                current.append((atom, atom_tokens))
+                current_tokens = atom_tokens
+                i += 1
+            continue
+
+        current.append((atom, atom_tokens))
         current_tokens += atom_tokens
         i += 1
 
     if current:
         chunks.append(current)
 
-    # Merge a too-small trailing chunk into its predecessor to avoid orphans.
+    # Merge very small orphan tail chunk into previous chunk
     if len(chunks) > 1:
-        last_tokens = count_tokens(" ".join(chunks[-1]))
-        if last_tokens < child_min * 0.5:
+        last_tokens = sum(t for _, t in chunks[-1])
+        if last_tokens < int(child_min * 0.5):
             chunks[-2].extend(chunks[-1])
             chunks.pop()
 
-    return [" ".join(c) for c in chunks]
+    return [
+        (" ".join(a for a, _ in c), sum(t for _, t in c))
+        for c in chunks
+    ]
+
+
+
+# --------------------------------------------------------------------------
+# Data model (unchanged)
+# --------------------------------------------------------------------------
+
+@dataclass
+class ChildChunk:
+    id: str
+    parent_id: str
+    text: str
+    embedding_text: str
+    tokens: int
+    heading_path: str
+    index_in_parent: int
+
+
+@dataclass
+class ParentChunk:
+    id: str
+    text: str
+    tokens: int
+    heading_path: str
+    index: int
+    children: List[ChildChunk] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -278,26 +361,6 @@ def chunk_markdown(
     overlap_ratio: float = 0.15,
     doc_summary: Optional[str] = None,
 ) -> dict:
-    """
-    Chunk markdown text using parent-child retrieval + contextual enrichment
-    + sliding overlap.
-
-    Args:
-        markdown_text: raw markdown source.
-        parent_token_range: (min, max) tokens per parent chunk.
-        child_token_range: (min, max) tokens per child chunk.
-        overlap_ratio: fraction (0.10-0.20 recommended) of a child chunk's
-            token budget carried forward into the next child as overlap.
-        doc_summary: optional 1-2 sentence document summary to prepend to
-            every child's embedding_text. If omitted, one is auto-extracted
-            from the document's first heading + first paragraph.
-
-    Returns:
-        {
-            "summary": str,
-            "parents": List[ParentChunk],   # parent.children -> List[ChildChunk]
-        }
-    """
     parent_min, parent_max = parent_token_range
     child_min, child_max = child_token_range
 
@@ -312,13 +375,14 @@ def chunk_markdown(
         parent = ParentChunk(
             id=parent_id,
             text=parent_text,
-            tokens=count_tokens(parent_text),
+            tokens=count_tokens(parent_text),  # one call, one per parent — cheap
             heading_path=heading_path,
             index=p_index,
         )
 
-        child_texts = _build_children(parent_text, child_min, child_max, overlap_ratio)
-        for c_index, child_text in enumerate(child_texts):
+        for c_index, (child_text, child_tokens) in enumerate(
+            _build_children(parent_text, child_min, child_max, overlap_ratio)
+        ):
             embedding_text = f"{summary}\n\n{child_text}" if summary else child_text
             parent.children.append(
                 ChildChunk(
@@ -326,7 +390,7 @@ def chunk_markdown(
                     parent_id=parent_id,
                     text=child_text,
                     embedding_text=embedding_text,
-                    tokens=count_tokens(child_text),
+                    tokens=child_tokens,
                     heading_path=heading_path,
                     index_in_parent=c_index,
                 )
@@ -335,4 +399,3 @@ def chunk_markdown(
         parents.append(parent)
 
     return {"summary": summary, "parents": parents}
-

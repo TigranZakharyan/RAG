@@ -4,7 +4,6 @@ from core.settings import settings
 from core.qdrant import qdrant_client as client
 
 class QdrantService:
-
     def __init__(self):
         self.client = client
 
@@ -32,14 +31,12 @@ class QdrantService:
         if not exists:
             self.client.create_collection(
                 collection_name=collection_name,
-                # Define named dense vector configuration
                 vectors_config={
                     "dense": models.VectorParams(
-                        size=1024,  # matches your model dimension
+                        size=1024,
                         distance=models.Distance.COSINE,
                     ),
                 },
-                # Define named sparse vector configuration for hybrid search
                 sparse_vectors_config={
                     "sparse": models.SparseVectorParams(),
                 },
@@ -75,6 +72,7 @@ class QdrantService:
         except Exception:
             # Collection may not exist yet.
             pass
+
 
 
 qdrant_service = QdrantService()

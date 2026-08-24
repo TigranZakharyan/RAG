@@ -15,6 +15,7 @@ services:
       - postgres
       - minio
       - qdrant
+      - ollama
     restart: unless-stopped
   
   postgres:
@@ -74,6 +75,7 @@ services:
       - postgres
       - redis
       - qdrant
+      - ollama
     restart: unless-stopped
   
   redis:
@@ -97,9 +99,31 @@ services:
       - qdrant_data:/qdrant/storage:z
     restart: unless-stopped
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_prod
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+      target: production
+    container_name: frontend_prod
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+
 volumes:
   postgres_data:
   pgadmin_data:
   minio_data:
   qdrant_data:
   redis_data:
+  ollama_data:

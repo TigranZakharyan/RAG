@@ -1,31 +1,32 @@
-from fastapi import Cookie, Depends, HTTPException, status, Depends
-from fastapi import Security
-from fastapi.security import APIKeyCookie
+from fastapi import Cookie, Depends, Header, HTTPException, status
 from sqlmodel import Session, select
 
 from core.database import get_session
 from libs.auth import verify_access_token
 from models.user import User
 
-access_token_cookie = APIKeyCookie(
-    name="access_token",
-    auto_error=True,
-)
 
 async def auth_dependency(
-    access_token: str = Depends(access_token_cookie),
+    access_token: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
 ) -> User:
-    if not access_token:
+    token = access_token
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1].strip()
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
         )
 
+
     try:
-        payload = verify_access_token(access_token)
+        payload = verify_access_token(token)
 
         user_id = payload.get("sub")
+
 
         if not user_id:
             raise HTTPException(

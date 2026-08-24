@@ -5,7 +5,6 @@ from core.settings import settings
 
 
 class EmbeddingService:
-
     def __init__(self):
         # Dense semantic embedding
         self.dense_model = SentenceTransformer(

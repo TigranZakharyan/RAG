@@ -76,10 +76,11 @@ async def login_user(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=True,       # False for local HTTP development
+        secure=False,      # Set to False for local HTTP dev
         samesite="lax",
-        max_age=60 * 60,
+        max_age=60 * 60 * 24,
     )
+
 
     return LoginResponse(
         access_token=access_token,

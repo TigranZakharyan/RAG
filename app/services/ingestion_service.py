@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -24,8 +25,11 @@ from pipelines.chunking import chunk_markdown
 
 from services.embedding_service import embedding_service
 
+logger = logging.getLogger("ingestion_service")
+
 
 class IngestionService:
+
 
     def __init__(
         self,
@@ -97,6 +101,14 @@ class IngestionService:
 
         session.add(job)
         session.commit()
+        logger.info(
+            "Job [%s] progress: %d%% | Stage: %s | Chunks: %s/%s",
+            self.job_id,
+            job.progress,
+            stage,
+            job.processed_chunks,
+            job.total_chunks,
+        )
 
     # -----------------------------------------
     # Cancel + rollback
@@ -106,7 +118,7 @@ class IngestionService:
         self,
         session: Session,
     ):
-
+        logger.warning("Job [%s] cancellation triggered. Rolling back Qdrant points.", self.job_id)
         job = self.get_job(session)
 
         if not job:
@@ -124,6 +136,7 @@ class IngestionService:
 
         session.add(job)
         session.commit()
+        logger.info("Job [%s] marked as CANCELLED.", self.job_id)
 
     # -----------------------------------------
     # Process document with FileProcessor
@@ -134,6 +147,7 @@ class IngestionService:
         temp_path: str,
         filename: str,
     ) -> str:
+        logger.info("Job [%s] converting document '%s' to markdown with Docling.", self.job_id, filename)
 
         async def _process() -> str:
 
@@ -162,7 +176,7 @@ class IngestionService:
     # -----------------------------------------
 
     def process(self):
-
+        logger.info("Job [%s] process started.", self.job_id)
         temp_path: str | None = None
 
         with Session(engine) as session:
@@ -170,6 +184,7 @@ class IngestionService:
             job = self.get_job(session)
 
             if not job:
+                logger.error("Job [%s] not found in database.", self.job_id)
                 return
 
             # ---------------------------------
@@ -182,6 +197,7 @@ class IngestionService:
                 IngestionStatus.FAILED,
                 IngestionStatus.CANCELLED,
             ):
+                logger.info("Job [%s] already in terminal state '%s'. Skipping.", self.job_id, job.status)
                 return
 
             # ---------------------------------
@@ -206,6 +222,7 @@ class IngestionService:
 
             session.add(job)
             session.commit()
+            logger.info("Job [%s] marked as PROCESSING (Conversation: %s, File: %s)", self.job_id, job.conversation_id, job.file_id)
 
             try:
 
@@ -220,8 +237,10 @@ class IngestionService:
 
                 if not db_file:
                     raise RuntimeError(
-                        "File not found"
+                        f"File ID {job.file_id} not found in database"
                     )
+
+                logger.info("Job [%s] retrieved file metadata: '%s' (%s bytes, path: %s)", self.job_id, db_file.original_filename, db_file.size, db_file.path)
 
                 # =============================
                 # Download from MinIO
@@ -237,6 +256,7 @@ class IngestionService:
                     self.cancel_and_rollback(session)
                     return
 
+                logger.info("Job [%s] downloading file from MinIO bucket '%s' path '%s'", self.job_id, settings.minio_bucket, db_file.path)
                 response = minio_client.get_object(
                     settings.minio_bucket,
                     db_file.path,
@@ -267,6 +287,8 @@ class IngestionService:
                     response.release_conn()
                     temp_file.close()
 
+                logger.info("Job [%s] downloaded to temporary file '%s'", self.job_id, temp_path)
+
                 # =============================
                 # Process document
                 # =============================
@@ -286,14 +308,10 @@ class IngestionService:
                     filename=db_file.original_filename,
                 )
 
+                logger.info("Job [%s] document processed to markdown (length: %d chars)", self.job_id, len(markdown))
+
                 # =============================
                 # Chunk
-                #
-                # chunk_markdown() returns:
-                #   {"summary": str, "parents": List[ParentChunk]}
-                # Each ParentChunk has .children: List[ChildChunk].
-                # Neither dataclass has a "chunk_type" field, so we
-                # flatten explicitly instead of filtering on it.
                 # =============================
 
                 self.update_progress(
@@ -306,6 +324,7 @@ class IngestionService:
                     self.cancel_and_rollback(session)
                     return
 
+                logger.info("Job [%s] chunking markdown document...", self.job_id)
                 chunk_result = chunk_markdown(
                     markdown
                 )
@@ -325,10 +344,11 @@ class IngestionService:
 
                 if not children:
                     raise RuntimeError(
-                        "No chunks generated"
+                        "No chunks generated from document"
                     )
 
                 total = len(children)
+                logger.info("Job [%s] chunking completed: %d parent chunks, %d child chunks.", self.job_id, len(parent_chunks), total)
 
                 job.total_chunks = total
 
@@ -345,9 +365,10 @@ class IngestionService:
                         job.conversation_id
                     )
                 )
+                logger.info("Job [%s] targeting Qdrant collection '%s'", self.job_id, collection_name)
 
                 # =============================
-                # Embedding
+                # Embedding & Indexing
                 # =============================
 
                 batch_size = 32
@@ -374,8 +395,6 @@ class IngestionService:
                         start:start + batch_size
                     ]
 
-                    # Embed using embedding_text (summary-prefixed)
-                    # for better retrieval quality.
                     texts = [
                         child.embedding_text
                         for child in batch
@@ -390,6 +409,8 @@ class IngestionService:
                         processed_chunks=start,
                         total_chunks=total,
                     )
+
+                    logger.info("Job [%s] generating embeddings for chunk batch %d-%d / %d", self.job_id, start + 1, min(start + len(batch), total), total)
 
                     dense_embeddings, sparse_embeddings = (
                         embedding_service
@@ -414,7 +435,6 @@ class IngestionService:
                             child.parent_id
                         )
 
-                        # Convert FastEmbed sparse output to Qdrant SparseVector model
                         sparse_vector = models.SparseVector(
                             indices=sparse_emb.indices.tolist(),
                             values=sparse_emb.values.tolist(),
@@ -423,48 +443,33 @@ class IngestionService:
                         points.append(
                             models.PointStruct(
                                 id=str(uuid4()),
-                                # Pass vectors as a dictionary for hybrid collections
                                 vector={
                                     "dense": dense_emb,
                                     "sparse": sparse_vector,
                                 },
                                 payload={
-                                    # Ownership
                                     "user_id": job.user_id,
-
-                                    # Relations
                                     "conversation_id":
                                         job.conversation_id,
-
                                     "file_id":
                                         job.file_id,
-
                                     "ingestion_id":
                                         job.id,
-
-                                    # Chunk
                                     "chunk_id":
                                         child.id,
-
                                     "parent_id":
                                         child.parent_id,
-
-                                    # Content
                                     "content":
                                         child.text,
-
                                     "parent_content": (
                                         parent.text
                                         if parent
                                         else None
                                     ),
-
                                     "chunk_type":
                                         "child",
-
                                     "token_count":
                                         child.tokens,
-
                                     "metadata": {
                                         "heading_path":
                                             child.heading_path,
@@ -476,11 +481,12 @@ class IngestionService:
                                 },
                             )
                         )
-                        
+
                     # =========================
                     # Upload
                     # =========================
 
+                    logger.info("Job [%s] upserting %d points into Qdrant collection '%s'", self.job_id, len(points), collection_name)
                     qdrant_service.client.upsert(
                         collection_name=collection_name,
                         points=points,
@@ -534,14 +540,17 @@ class IngestionService:
 
                 session.add(job)
                 session.commit()
+                logger.info("Job [%s] completed successfully! (Total chunks indexed: %d)", self.job_id, total)
 
             except Exception as e:
 
                 session.rollback()
 
-                print(
-                    f"INGESTION ERROR "
-                    f"{self.job_id}: {e}"
+                logger.error(
+                    "Job [%s] failed with error: %s",
+                    self.job_id,
+                    str(e),
+                    exc_info=True,
                 )
 
                 # -----------------------------
@@ -554,10 +563,10 @@ class IngestionService:
                         ingestion_id=job.id,
                     )
                 except Exception as rollback_error:
-                    print(
-                        f"QDRANT ROLLBACK ERROR "
-                        f"{self.job_id}: "
-                        f"{rollback_error}"
+                    logger.error(
+                        "Job [%s] Qdrant rollback error: %s",
+                        self.job_id,
+                        str(rollback_error),
                     )
 
                 # -----------------------------
@@ -598,8 +607,8 @@ class IngestionService:
                     except FileNotFoundError:
                         pass
                     except Exception as cleanup_error:
-                        print(
-                            f"TEMP FILE CLEANUP ERROR "
-                            f"{self.job_id}: "
-                            f"{cleanup_error}"
+                        logger.warning(
+                            "Job [%s] temp file cleanup error: %s",
+                            self.job_id,
+                            str(cleanup_error),
                         )
